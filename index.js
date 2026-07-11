@@ -1,243 +1,183 @@
-const { Client, GatewayIntentBits, Partials, Collection } = require('discord.js');
+const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
 const express = require('express');
 const axios = require('axios');
 
-// ===============================================================
-// 🛠️ 設定エリア：あなたの環境に合わせてIDを書き換えてください
-// ===============================================================
-const DISCORD_BOT_TOKEN = process.env.DISCORD_TOKEN || "ここにあなたのBotのトークン（またはReplitのSecretsを使用）";
-const GAS_WEBHOOK_URL = "https://script.google.com/macros/s/.../exec"; // あなたのGASのWebアプリURL
+const app = express();
+app.use(express.json());
 
-// 👇 臨時VCの起点となるチャンネルIDとカテゴリID
-const TRIGGER_VC_ID = "552112398626979841";
-const CATEGORY_ID = "1525454867316084857";
+// 環境変数からトークンとGASのURLを読み込み
+const DISCORD_BOT_TOKEN = process.env.DISCORD_TOKEN;
+const GAS_WEBHOOK_URL = process.env.GAS_WEBHOOK_URL;
 
-// ===============================================================
-// 🏗️ Bot初期化
-// ===============================================================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildVoiceStates
-  ],
-  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
+    GatewayIntentBits.MessageContent
+  ]
 });
 
-// 作成された臨時VCのIDを一時保持する記憶エリア
-const tempChannels = new Set();
+// GASから設定（ID）を取得するための変数
+let TRIGGER_VC_ID = "";
+let CATEGORY_ID = "";
 
-client.once('ready', () => {
+// 作成された臨時VCを追跡するマップ (チャンネルID => 番号)
+const createdVoiceChannels = new Map();
+
+// サーバー生存確認用のエンドポイント
+app.get('/', (req, res) => {
+  res.send('Discord Bot is running!');
+});
+
+// Botの起動
+client.once('ready', async () => {
   console.log(`🤖 Botが正常に起動しました: ${client.user.tag}`);
-});
-
-// ===============================================================
-// 🔄 機能1：リアクション追加・削除を検知してGASへ送信
-// ===============================================================
-client.on('messageReactionAdd', async (reaction, user) => {
-  if (user.bot) return;
-  if (reaction.partial) {
-    try { await reaction.fetch(); } catch (error) { return console.error('リアクション取得失敗:', error); }
-  }
-  sendToGas({
-    event: 'reactionAdd',
-    action: '追加',
-    userName: reaction.message.guild?.members.cache.get(user.id)?.displayName || user.username,
-    userId: user.id,
-    emoji: reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name,
-    messageId: reaction.message.id,
-    messageContent: reaction.message.content || "（内容取得不可）"
-  });
-});
-
-client.on('messageReactionRemove', async (reaction, user) => {
-  if (user.bot) return;
-  if (reaction.partial) {
-    try { await reaction.fetch(); } catch (error) { return console.error('リアクション取得失敗:', error); }
-  }
-  sendToGas({
-    event: 'reactionRemove',
-    action: '削除',
-    userName: reaction.message.guild?.members.cache.get(user.id)?.displayName || user.username,
-    userId: user.id,
-    emoji: reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name,
-    messageId: reaction.message.id,
-    messageContent: reaction.message.content || "（内容取得不可）"
-  });
-});
-
-// ===============================================================
-// 🗑️ 機能2：Discord側でメッセージが削除されたらGAS側も連動削除
-// ===============================================================
-client.on('messageDelete', async (message) => {
-  sendToGas({
-    event: 'messageDelete',
-    messageId: message.id
-  });
-});
-
-// GASへのデータ送信関数
-async function sendToGas(payload) {
+  
+  // 起動時にGASから設定（ID情報）を自動取得
   try {
-    await axios.post(GAS_WEBHOOK_URL, payload);
+    const response = await axios.post(GAS_WEBHOOK_URL, { action: "vc_config" });
+    TRIGGER_VC_ID = response.data.triggerVcId;
+    CATEGORY_ID = response.data.categoryId;
+    console.log(`📡 GASから設定を読み込みました。トリガーVC: ${TRIGGER_VC_ID}`);
   } catch (error) {
-    console.error('GASへのデータ送信中にエラーが発生しました:', error.message);
+    console.error("❌ GASからの設定取得に失敗しました:", error.message);
   }
-}
+});
 
-// ===============================================================
-// 🔊 機能3：臨時VCの自動生成＆自動消去（特製ユーモア命名）
-// ===============================================================
+// ==========================================
+// 【修正】VCチャンネル自動作成＆削除ロジック（連番・最大25部屋）
+// ==========================================
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const member = newState.member;
   if (!member || member.user.bot) return;
 
-  // 1️⃣ 【入室検知】ユーザーがトリガーVC（部屋を作る）に入室した場合
-  if (newState.channelId === TRIGGER_VC_ID) {
+  // 1. ユーザーがトリガーVCに入室した場合
+  if (newState.channelId === TRIGGER_VC_ID && oldState.channelId !== TRIGGER_VC_ID) {
     try {
       const guild = newState.guild;
 
-      // ✨【超パワーアップ】指定ワード ＋ ランダム20個の特製部屋名テンプレート！
-      const funnyTemplates = [
-        // 👇 ご指定のワードベースのテンプレート
-        `🔊 鯛人たち`,
-        `🔊 ${member.displayName}「DEはねぇ～強いんですよ」`,
-        `🔊 歯茎ｸﾞｷｸﾞｷｸﾞｷ部屋`,
-        `🔊 窃盗犯デニスに警戒する${member.displayName}`,
-        `🔊 ${member.displayName}が主催する深夜の飲酒フットサル会場`,
-
-        // 👇 ランダムに生成したユーモアテンプレート20個
-        `🔊 ${member.displayName}がただただ息を引き取る空間`,
-        `🔊 ${member.displayName}が現実逃避をするための隔離病棟`,
-        `🔊 ${member.displayName}の限界ネトゲ廃人養成所`,
-        `🔊 ${member.displayName}が無限に寝言を供述する部屋`,
-        `🔊 ${member.displayName}が絶叫しながら反省する独房`,
-        `🔊 ${member.displayName}の生存報告会場（安否確認用）`,
-        `🔊 ${member.displayName}のIQが一時的に3になる部屋`,
-        `🔊 ${member.displayName}が世界の中心でバグを叫ぶ部屋`,
-        `🔊 ${member.displayName}が人知れず虚無と戦うシェルター`,
-        `🔊 本日の${member.displayName}の給水所（水分補給）`,
-        `🔊 ${member.displayName}のあきらめたらそこで試合終了VC`,
-        `🔊 ${member.displayName}による有識者会議（なお議題は未定）`,
-        `🔊 ${member.displayName}がすべての責任を押し付ける部屋`,
-        `🔊 ${member.displayName}の1ギガの通信制限との戦い`,
-        `🔊 【朗報】${member.displayName}がやる気を出した部屋`,
-        `🔊 【悲報】${member.displayName}がすでに満身創痍な部屋`,
-        `🔊 ${member.displayName}のただ座っているだけで褒められる席`,
-        `🔊 ${member.displayName}が裏でコソコソ育成している空間`
-      ];
-
-      // ランダムで1つフレーズを選択
-      const randomIndex = Math.floor(Math.random() * funnyTemplates.length);
-      const channelName = funnyTemplates[randomIndex];
-
-      // 新しいボイスチャンネルを作成
-      const newChannel = await guild.channels.create({
-        name: channelName,
-        type: 2, // 2 はボイスチャンネル
-        parent: CATEGORY_ID || null,
-        bitrate: 96000 // ブーストLv3環境用（高音質）
-      });
-
-      // 作成したチャンネルIDを記憶リストに登録
-      tempChannels.add(newChannel.id);
-
-      // ユーザーを作成した新しいVCへ強制移動
-      await member.voice.setChannel(newChannel);
-      console.log(`[VC作成] 面白部屋名を生成しました: ${channelName}`);
-
-    } catch (error) {
-      console.error('臨時VCの自動作成、またはメンバー移動中にエラーが発生しました:', error);
-    }
-  }
-
-  // 2️⃣ 【退室検知】ユーザーが臨時VCから切断、または別の部屋に移動した場合
-  if (oldState.channelId && tempChannels.has(oldState.channelId)) {
-    const oldChannel = oldState.channel;
-
-    // 中に残っているメンバーが 0人（空っぽ）になった場合
-    if (oldChannel && oldChannel.members.size === 0) {
-      try {
-        await oldChannel.delete();
-        tempChannels.delete(oldState.channelId); // 記憶リストから削除
-        console.log(`[VC削除] 誰もいなくなったため、臨時VC「${oldChannel.name}」を自動削除しました。`);
-      } catch (error) {
-        console.error('臨時VCの自動削除中にエラーが発生しました:', error);
-      }
-    }
-  }
-});
-
-// ===============================================================
-// 🌐 Expressサーバーの構築（GASからの「一括完全同期」リクエストを受付）
-// ===============================================================
-const app = express();
-app.use(express.json());
-
-app.post('/sync', async (req, res) => {
-  res.status(200).json({ status: "processing", message: "一括同期を開始します。" });
-  console.log("🔄 GASからのリクエストにより、超・一括完全同期処理を開始します...");
-
-  try {
-    const guilds = client.guilds.cache;
-    const allLogs = [];
-
-    for (const [guildId, guild] of guilds) {
-      const channels = await guild.channels.fetch();
-      const textChannels = channels.filter(c => c.isTextBased());
-
-      for (const [channelId, channel] of textChannels) {
-        try {
-          const messages = await channel.messages.fetch({ limit: 100 });
-          for (const [messageId, message] of messages) {
-            const reactions = message.reactions.cache;
-            for (const [emojiId, reaction] of reactions) {
-              const users = await reaction.users.fetch();
-              for (const [userId, user] of users) {
-                if (user.bot) continue;
-
-                const member = await guild.members.fetch(userId).catch(() => null);
-                const userName = member ? member.displayName : user.username;
-                const emojiDisplay = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
-
-                allLogs.push({
-                  timestamp: message.createdAt.toISOString(),
-                  userName: userName,
-                  userId: userId,
-                  emoji: emojiDisplay,
-                  action: '追加',
-                  messageId: messageId,
-                  messageContent: message.content || "（内容取得不可）"
-                });
-              }
-            }
-          }
-        } catch (err) {
-          // スキップ
+      // 現在使われている番号（1〜25）を調査
+      const usedNumbers = new Set(createdVoiceChannels.values());
+      
+      // 1から順に空いている番号を探す
+      let nextNumber = -1;
+      for (let i = 1; i <= 25; i++) {
+        if (!usedNumbers.has(i)) {
+          nextNumber = i;
+          break;
         }
       }
+
+      // もし25部屋すべて埋まっていたら作成しない
+      if (nextNumber === -1) {
+        console.log("⚠️ 最大部屋数（25部屋）に達しているため、新規作成をスキップしました。");
+        // トリガーVCから一般のロビーなどへ戻す処理などを入れる場合はここに書きますが、一旦ログのみ
+        return;
+      }
+
+      // 新しいチャンネル名（例: 自動VC-1）
+      const channelName = `自動VC-${nextNumber}`;
+
+      // 臨時VCの作成
+      const newChannel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildVoice,
+        parent: CATEGORY_ID,
+        reason: 'ユーザー入室による臨時VC自動作成'
+      });
+
+      // マップに記録（どのチャンネルが何番か）
+      createdVoiceChannels.set(newChannel.id, nextNumber);
+
+      // ユーザーを作成した部屋に移動させる
+      await member.voice.setChannel(newChannel);
+      console.log(`🔊 ${channelName} を作成し、${member.user.tag} を移動しました。`);
+
+    } catch (error) {
+      console.error('❌ 臨時VCの作成または移動に失敗しました:', error);
     }
+  }
 
-    await axios.post(GAS_WEBHOOK_URL, {
-      event: 'bulkSync',
-      data: allLogs
-    });
-    console.log(`✅ 一括同期が完了しました。総リアクション数: ${allLogs.length}件`);
-
-  } catch (error) {
-    console.error('一括同期処理中に致命的なエラーが発生しました:', error.message);
+  // 2. ユーザーがVCから退室、または別のVCに移動した場合
+  if (oldState.channelId && oldState.channelId !== newState.channelId) {
+    const oldChannel = oldState.channel;
+    
+    // その部屋がBotが作った臨時VC一覧に存在し、かつメンバーが0人になった場合
+    if (createdVoiceChannels.has(oldState.channelId) && oldChannel && oldChannel.members.size === 0) {
+      try {
+        const number = createdVoiceChannels.get(oldState.channelId);
+        await oldChannel.delete('臨時VCに誰もいなくなったため自動削除');
+        createdVoiceChannels.delete(oldState.channelId); // マップから削除（番号が解放される）
+        console.log(`🗑️ 誰もいなくなったため 自動VC-${number} を削除しました。`);
+      } catch (error) {
+        console.error('❌ 臨時VCの削除に失敗しました:', error);
+      }
+    }
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('Bot is running and voice tracking is active!');
+// ==========================================
+// スタンプ（リアクション）ログ転送ロジック
+// ==========================================
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+
+  if (reaction.partial) {
+    try {
+      await reaction.fetch();
+    } catch (error) {
+      console.error('リアクションの取得に失敗しました:', error);
+      return;
+    }
+  }
+
+  const message = reaction.message;
+  const timestamp = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const emoji = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
+
+  let categoryName = "なし";
+  if (message.channel.parent) {
+    categoryName = message.channel.parent.name;
+  }
+
+  const payload = {
+    action: "add_stamp",
+    timestamp: timestamp,
+    messageId: message.id,
+    username: user.username,
+    emoji: emoji,
+    category: categoryName,
+    content: message.content || "[画像または埋め込みメッセージ]"
+  };
+
+  try {
+    await axios.post(GAS_WEBHOOK_URL, payload);
+  } catch (error) {
+    console.error('GASへのスタンプ転送に失敗しました:', error.message);
+  }
 });
 
-app.listen(3000, () => {
-  console.log('🌐 Web Server listening on port 3000');
+// メッセージ削除時の連動削除
+client.on('messageDelete', async (message) => {
+  const payload = {
+    action: "delete_message",
+    messageId: message.id
+  };
+
+  try {
+    await axios.post(GAS_WEBHOOK_URL, payload);
+    console.log(`🗑️ メッセージ削除を検知。GAS側のログを削除しました。(ID: ${message.id})`);
+  } catch (error) {
+    console.error('GASへの削除イベント転送に失敗しました:', error.message);
+  }
+});
+
+// Renderのポート待受（これがないとRenderでエラーになります）
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🌐 Web Server listening on port ${PORT}`);
 });
 
 client.login(DISCORD_BOT_TOKEN);
