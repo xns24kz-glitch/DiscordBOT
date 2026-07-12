@@ -9,7 +9,10 @@ app.use(express.json());
 const DISCORD_BOT_TOKEN = process.env.DISCORD_TOKEN;
 const GAS_WEBHOOK_URL = process.env.GAS_WEBHOOK_URL;
 
-// 🏗️ Bot初期化（すべての権限とパーシャルを網羅）
+// 🎯 集計対象とする特定のテキストチャンネルID
+const TARGET_CHANNEL_ID = "1524050005290127370";
+
+// 🏗️ Bot初期化
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -24,7 +27,7 @@ const client = new Client({
 
 // GASから設定（ID情報）を取得するための変数
 let TRIGGER_VC_ID = "";
-let CATEGORY_ID = "";
+let CATEGORY_ID = "1525454867316084857";
 
 // 作成された臨時VCを追跡するマップ (チャンネルID => 番号)
 const createdVoiceChannels = new Map();
@@ -124,6 +127,9 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // ===============================================================
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
+  // 指定された集計チャンネル以外のスタンプは無視
+  if (reaction.message.channel.id !== TARGET_CHANNEL_ID) return;
+
   if (reaction.partial) {
     try { await reaction.fetch(); } catch (error) { return console.error('リアクション取得失敗:', error); }
   }
@@ -153,6 +159,9 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
 client.on('messageReactionRemove', async (reaction, user) => {
   if (user.bot) return;
+  // 指定された集計チャンネル以外のスタンプ削除は無視
+  if (reaction.message.channel.id !== TARGET_CHANNEL_ID) return;
+
   if (reaction.partial) {
     try { await reaction.fetch(); } catch (error) { return console.error('リアクション取得失敗:', error); }
   }
@@ -184,6 +193,9 @@ client.on('messageReactionRemove', async (reaction, user) => {
 // 🗑️ 機能3：メッセージ削除時の連動ログ削除
 // ===============================================================
 client.on('messageDelete', async (message) => {
+  // 指定された集計チャンネル以外のメッセージ削除は無視
+  if (message.channel.id !== TARGET_CHANNEL_ID) return;
+
   const payload = {
     event: 'messageDelete',
     messageId: message.id
@@ -198,49 +210,48 @@ client.on('messageDelete', async (message) => {
 });
 
 // ===============================================================
-// 🌐 機能4：GASの「最重要一括同期ボタン」を受け付けるエンドポイント (/sync)
+// 🌐 機能4：GASからの一括同期リクエストを受付 (/sync)
 // ===============================================================
 app.post('/sync', async (req, res) => {
-  res.status(200).json({ status: "processing", message: "一括同期を開始します。" });
-  console.log("🔄 GASからのリクエストにより、一括完全同期処理を開始します...");
+  res.status(200).json({ status: "processing", message: "一局同期を開始します。" });
+  console.log(`🔄 GASからのリクエストにより、対象チャンネル (${TARGET_CHANNEL_ID}) の一括同期処理を開始します...`);
 
   try {
     const guilds = client.guilds.cache;
     const allLogs = [];
 
     for (const [guildId, guild] of guilds) {
-      const channels = await guild.channels.fetch();
-      const textChannels = channels.filter(c => c.isTextBased());
+      try {
+        // 特定の対象チャンネルだけをピンポイントで取得して処理
+        const channel = await guild.channels.fetch(TARGET_CHANNEL_ID);
+        if (!channel || !channel.isTextBased()) continue;
 
-      for (const [channelId, channel] of textChannels) {
-        try {
-          const messages = await channel.messages.fetch({ limit: 100 });
-          for (const [messageId, message] of messages) {
-            const reactions = message.reactions.cache;
-            for (const [emojiId, reaction] of reactions) {
-              const users = await reaction.users.fetch();
-              for (const [userId, user] of users) {
-                if (user.bot) continue;
+        const messages = await channel.messages.fetch({ limit: 100 });
+        for (const [messageId, message] of messages) {
+          const reactions = message.reactions.cache;
+          for (const [emojiId, reaction] of reactions) {
+            const users = await reaction.users.fetch();
+            for (const [userId, user] of users) {
+              if (user.bot) continue;
 
-                const member = await guild.members.fetch(userId).catch(() => null);
-                const userName = member ? member.displayName : user.username;
-                const emojiDisplay = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
+              const member = await guild.members.fetch(userId).catch(() => null);
+              const userName = member ? member.displayName : user.username;
+              const emojiDisplay = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
 
-                allLogs.push({
-                  timestamp: message.createdAt.toISOString(),
-                  userName: userName,
-                  userId: userId,
-                  emoji: emojiDisplay,
-                  action: '追加',
-                  messageId: messageId,
-                  messageContent: message.content || "（内容取得不可）"
-                });
-              }
+              allLogs.push({
+                timestamp: message.createdAt.toISOString(),
+                userName: userName,
+                userId: userId,
+                emoji: emojiDisplay,
+                action: '追加',
+                messageId: messageId,
+                messageContent: message.content || "（内容取得不可）"
+              });
             }
           }
-        } catch (err) {
-          // 閲覧権限のないチャンネル等はスキップ
         }
+      } catch (err) {
+        console.error(`❌ 対象チャンネルのログ取得中にエラーが発生しました:`, err.message);
       }
     }
 
@@ -248,7 +259,7 @@ app.post('/sync', async (req, res) => {
       event: 'bulkSync',
       data: allLogs
     });
-    console.log(`✅ 一括同期が完了しました。総リアクション数: ${allLogs.length}件`);
+    console.log(`✅ 一括同期が完了しました。対象チャンネルの総リアクション数: ${allLogs.length}件`);
 
   } catch (error) {
     console.error('一括同期処理中にエラーが発生しました:', error.message);
