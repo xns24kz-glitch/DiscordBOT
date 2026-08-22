@@ -2,17 +2,37 @@ const { Client, GatewayIntentBits, Partials, ChannelType } = require('discord.js
 const express = require('express');
 const axios = require('axios');
 
-const app = express();
-app.use(express.json());
+// ===============================================================
+// 設定
+// ===============================================================
 
-// 環境変数からトークンとGASのURLを読み込み
 const DISCORD_BOT_TOKEN = process.env.DISCORD_TOKEN;
 const GAS_WEBHOOK_URL = process.env.GAS_WEBHOOK_URL;
+const TARGET_CHANNEL_ID = '1524050005290127370';
+const PORT = Number(process.env.PORT) || 3000;
 
-// 🎯 集計対象とする特定のテキストチャンネルID
-const TARGET_CHANNEL_ID = "1524050005290127370";
+// 一括同期で取得するメッセージ数。必要ならRenderの環境変数で変更できます。
+const MAX_SYNC_MESSAGES = Math.max(
+  100,
+  Number.parseInt(process.env.MAX_SYNC_MESSAGES || '1000', 10) || 1000
+);
 
-// 🏗️ Bot初期化
+if (!DISCORD_BOT_TOKEN) {
+  throw new Error('Renderの環境変数 DISCORD_TOKEN が設定されていません。');
+}
+
+if (!GAS_WEBHOOK_URL) {
+  throw new Error('Renderの環境変数 GAS_WEBHOOK_URL が設定されていません。');
+}
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+const gasClient = axios.create({
+  timeout: 15000,
+  headers: { 'Content-Type': 'application/json' }
+});
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -25,249 +45,388 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-// GASから設定（ID情報）を取得するための変数
-let TRIGGER_VC_ID = "";
-let CATEGORY_ID = "";
+let TRIGGER_VC_ID = '';
+let CATEGORY_ID = '';
+let syncInProgress = false;
 
-// 作成された臨時VCを追跡するマップ (チャンネルID => 番号)
+// チャンネルID => 部屋番号
 const createdVoiceChannels = new Map();
+const reservedVoiceNumbers = new Set();
 
-// サーバー生存確認用のエンドポイント
+// ===============================================================
+// 共通処理
+// ===============================================================
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function postToGas(payload, attempts = 3) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await gasClient.post(GAS_WEBHOOK_URL, payload);
+    } catch (error) {
+      lastError = error;
+      const status = error.response?.status;
+      console.error(
+        `❌ GAS通信失敗 (${attempt}/${attempts})` +
+        `${status ? ` HTTP ${status}` : ''}: ${error.message}`
+      );
+
+      if (attempt < attempts) {
+        await wait(1000 * attempt);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+async function loadVoiceConfig() {
+  try {
+    const response = await postToGas({ event: 'vc_config' });
+    const triggerVcId = String(response.data?.triggerVcId || '').trim();
+    const categoryId = String(response.data?.categoryId || '').trim();
+
+    if (!triggerVcId || !categoryId) {
+      throw new Error('GASから受け取ったVC設定が空です。');
+    }
+
+    TRIGGER_VC_ID = triggerVcId;
+    CATEGORY_ID = categoryId;
+    console.log(`📡 VC設定取得完了: トリガー=${TRIGGER_VC_ID}, カテゴリ=${CATEGORY_ID}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ VC設定取得失敗: ${error.message}`);
+    return false;
+  }
+}
+
+async function restoreTemporaryVoiceChannels() {
+  if (!CATEGORY_ID) return;
+
+  try {
+    const category = await client.channels.fetch(CATEGORY_ID);
+    if (!category || !category.guild) {
+      throw new Error('設定されたカテゴリーが見つかりません。');
+    }
+
+    const guild = category.guild;
+    await guild.channels.fetch();
+    createdVoiceChannels.clear();
+
+    const temporaryChannels = guild.channels.cache.filter(channel =>
+      channel.type === ChannelType.GuildVoice &&
+      channel.parentId === CATEGORY_ID &&
+      /^自動VC-(?:[1-9]|1\d|2[0-5])$/.test(channel.name)
+    );
+
+    for (const channel of temporaryChannels.values()) {
+      const number = Number.parseInt(channel.name.replace('自動VC-', ''), 10);
+
+      // 再起動時点ですでに空なら、残骸として安全に削除します。
+      if (channel.members.size === 0) {
+        try {
+          await channel.delete('Bot再起動時に空の臨時VCを整理');
+          console.log(`🧹 空の ${channel.name} を整理しました。`);
+        } catch (error) {
+          console.error(`❌ ${channel.name} の整理失敗: ${error.message}`);
+        }
+        continue;
+      }
+
+      createdVoiceChannels.set(channel.id, number);
+    }
+
+    console.log(`🔄 使用中の臨時VCを${createdVoiceChannels.size}件復元しました。`);
+  } catch (error) {
+    console.error(`❌ 臨時VCの復元失敗: ${error.message}`);
+  }
+}
+
+async function prepareReaction(reaction) {
+  if (reaction.partial) await reaction.fetch();
+  if (reaction.message.partial) await reaction.message.fetch();
+  return reaction;
+}
+
+function makeReactionPayload(reaction, user, action) {
+  const guildMember = reaction.message.guild?.members.cache.get(user.id);
+  const categoryName = reaction.message.channel.parent?.name || 'なし';
+
+  return {
+    event: action === '追加' ? 'reactionAdd' : 'reactionRemove',
+    action,
+    userName: guildMember?.displayName || user.username,
+    userId: user.id,
+    emoji: reaction.emoji.id
+      ? `<:${reaction.emoji.name}:${reaction.emoji.id}>`
+      : reaction.emoji.name,
+    messageId: reaction.message.id,
+    messageContent: reaction.message.content || '[画像または埋め込みメッセージ]',
+    category: categoryName
+  };
+}
+
+// ===============================================================
+// Renderの生存確認
+// ===============================================================
+
 app.get('/', (req, res) => {
-  res.send('Discord Bot is running and sync system is active!');
+  res.status(client.isReady() ? 200 : 503).json({
+    webServer: 'running',
+    discord: client.isReady() ? 'connected' : 'disconnected',
+    bot: client.user?.tag || null,
+    syncInProgress
+  });
 });
 
-// Bot起動時の処理
+// ===============================================================
+// Bot起動
+// ===============================================================
+
 client.once('ready', async () => {
-  console.log(`🤖 Botが正常に起動しました: ${client.user.tag}`);
-  
-  // 起動時にGASから自動でID情報を引っ張ってくる
-  try {
-    const response = await axios.post(GAS_WEBHOOK_URL, { event: "vc_config" });
-    TRIGGER_VC_ID = response.data.triggerVcId;
-    CATEGORY_ID = response.data.categoryId;
-    console.log(`📡 GASから設定を読み込みました。トリガーVC: ${TRIGGER_VC_ID}, カテゴリ: ${CATEGORY_ID}`);
-  } catch (error) {
-    console.error("❌ GASからの設定取得に失敗しました。時間をおいて再デプロイしてください:", error.message);
+  console.log(`🤖 Bot起動完了: ${client.user.tag}`);
+
+  const loaded = await loadVoiceConfig();
+  if (loaded) {
+    await restoreTemporaryVoiceChannels();
+  } else {
+    console.log('⏳ 60秒後にVC設定の取得を再試行します。');
+    const retryTimer = setInterval(async () => {
+      if (await loadVoiceConfig()) {
+        clearInterval(retryTimer);
+        await restoreTemporaryVoiceChannels();
+      }
+    }, 60000);
   }
 });
 
 // ===============================================================
-// 🔊 機能1：臨時VCの自動生成＆自動消去（連番・最大25部屋）
+// 機能1：臨時VCの自動生成・自動削除
 // ===============================================================
+
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const member = newState.member;
   if (!member || member.user.bot) return;
 
-  // 1. ユーザーがトリガーVCに入室した場合
   if (newState.channelId === TRIGGER_VC_ID && oldState.channelId !== TRIGGER_VC_ID) {
-    try {
-      const guild = newState.guild;
+    let nextNumber = -1;
 
-      // 現在使われている連番（1〜25）を調査
-      const usedNumbers = new Set(createdVoiceChannels.values());
-      
-      // 1から順に空いている番号を探す
-      let nextNumber = -1;
-      for (let i = 1; i <= 25; i++) {
-        if (!usedNumbers.has(i)) {
-          nextNumber = i;
+    try {
+      const usedNumbers = new Set([
+        ...createdVoiceChannels.values(),
+        ...reservedVoiceNumbers.values()
+      ]);
+
+      for (let number = 1; number <= 25; number++) {
+        if (!usedNumbers.has(number)) {
+          nextNumber = number;
           break;
         }
       }
 
-      // 25部屋すべて埋まっていたら作成をスキップ
       if (nextNumber === -1) {
-        console.log("⚠️ 最大部屋数（25部屋）に達しているため、新規作成をスキップしました。");
+        console.log('⚠️ 臨時VCが最大数（25部屋）に達しています。');
         return;
       }
 
+      // 同時入室で同じ番号が選ばれないよう、作成前に予約します。
+      reservedVoiceNumbers.add(nextNumber);
       const channelName = `自動VC-${nextNumber}`;
 
-      // 臨時VCの作成
-      const newChannel = await guild.channels.create({
+      const newChannel = await newState.guild.channels.create({
         name: channelName,
         type: ChannelType.GuildVoice,
         parent: CATEGORY_ID || null,
         reason: 'ユーザー入室による臨時VC自動作成'
       });
 
-      // マップに記録（どのチャンネルが何番か）
       createdVoiceChannels.set(newChannel.id, nextNumber);
-
-      // ユーザーを作成した部屋に移動させる
       await member.voice.setChannel(newChannel);
       console.log(`🔊 ${channelName} を作成し、${member.user.tag} を移動しました。`);
-
     } catch (error) {
-      console.error('❌ 臨時VCの作成または移動に失敗しました:', error);
+      console.error(`❌ 臨時VCの作成・移動失敗: ${error.message}`);
+    } finally {
+      if (nextNumber !== -1) reservedVoiceNumbers.delete(nextNumber);
     }
   }
 
-  // 2. ユーザーがVCから退室、または別のVCに移動した場合
   if (oldState.channelId && oldState.channelId !== newState.channelId) {
     const oldChannel = oldState.channel;
-    
-    // その部屋がBotの作った臨時VCであり、かつメンバーが0人になった場合
-    if (createdVoiceChannels.has(oldState.channelId) && oldChannel && oldChannel.members.size === 0) {
+
+    if (
+      createdVoiceChannels.has(oldState.channelId) &&
+      oldChannel &&
+      oldChannel.members.size === 0
+    ) {
+      const number = createdVoiceChannels.get(oldState.channelId);
+
       try {
-        const number = createdVoiceChannels.get(oldState.channelId);
-        await oldChannel.delete('臨時VCに誰もいなくなったため自動削除');
-        createdVoiceChannels.delete(oldState.channelId); // マップから削除して番号解放
-        console.log(`🗑️ 誰もいなくなったため 自動VC-${number} を削除しました。`);
+        await oldChannel.delete('臨時VCが空になったため自動削除');
+        createdVoiceChannels.delete(oldState.channelId);
+        console.log(`🗑️ 自動VC-${number} を削除しました。`);
       } catch (error) {
-        console.error('❌ 臨時VCの削除に失敗しました:', error);
+        console.error(`❌ 自動VC-${number} の削除失敗: ${error.message}`);
       }
     }
   }
 });
 
 // ===============================================================
-// 🔄 機能2：リアルタイムでのリアクション（スタンプ）追加・削除検知
+// 機能2：リアクション追加・削除
 // ===============================================================
+
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
-  // 指定された集計チャンネル以外のスタンプは無視
-  if (reaction.message.channel.id !== TARGET_CHANNEL_ID) return;
-
-  if (reaction.partial) {
-    try { await reaction.fetch(); } catch (error) { return console.error('リアクション取得失敗:', error); }
-  }
-
-  let categoryName = "なし";
-  if (reaction.message.channel.parent) {
-    categoryName = reaction.message.channel.parent.name;
-  }
-
-  const payload = {
-    event: 'reactionAdd',
-    action: '追加',
-    userName: reaction.message.guild?.members.cache.get(user.id)?.displayName || user.username,
-    userId: user.id,
-    emoji: reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name,
-    messageId: reaction.message.id,
-    messageContent: reaction.message.content || "[画像または埋め込みメッセージ]",
-    category: categoryName
-  };
 
   try {
-    await axios.post(GAS_WEBHOOK_URL, payload);
+    await prepareReaction(reaction);
+    if (reaction.message.channelId !== TARGET_CHANNEL_ID) return;
+    await postToGas(makeReactionPayload(reaction, user, '追加'));
   } catch (error) {
-    console.error('GASへのスタンプ転送に失敗しました:', error.message);
+    console.error(`❌ リアクション追加の処理失敗: ${error.message}`);
   }
 });
 
 client.on('messageReactionRemove', async (reaction, user) => {
   if (user.bot) return;
-  // 指定された集計チャンネル以外のスタンプ削除は無視
-  if (reaction.message.channel.id !== TARGET_CHANNEL_ID) return;
-
-  if (reaction.partial) {
-    try { await reaction.fetch(); } catch (error) { return console.error('リアクション取得失敗:', error); }
-  }
-
-  let categoryName = "なし";
-  if (reaction.message.channel.parent) {
-    categoryName = reaction.message.channel.parent.name;
-  }
-
-  const payload = {
-    event: 'reactionRemove',
-    action: '削除',
-    userName: reaction.message.guild?.members.cache.get(user.id)?.displayName || user.username,
-    userId: user.id,
-    emoji: reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name,
-    messageId: reaction.message.id,
-    messageContent: reaction.message.content || "[画像または埋め込みメッセージ]",
-    category: categoryName
-  };
 
   try {
-    await axios.post(GAS_WEBHOOK_URL, payload);
+    await prepareReaction(reaction);
+    if (reaction.message.channelId !== TARGET_CHANNEL_ID) return;
+    await postToGas(makeReactionPayload(reaction, user, '削除'));
   } catch (error) {
-    console.error('GASへのスタンプ削除転送に失敗しました:', error.message);
+    console.error(`❌ リアクション削除の処理失敗: ${error.message}`);
   }
 });
 
 // ===============================================================
-// 🗑️ 機能3：メッセージ削除時の連動ログ削除
+// 機能3：メッセージ削除時のログ削除
 // ===============================================================
-client.on('messageDelete', async (message) => {
-  // 指定された集計チャンネル以外のメッセージ削除は無視
-  if (message.channel.id !== TARGET_CHANNEL_ID) return;
 
-  const payload = {
-    event: 'messageDelete',
-    messageId: message.id
-  };
+client.on('messageDelete', async message => {
+  if (message.channelId !== TARGET_CHANNEL_ID) return;
 
   try {
-    await axios.post(GAS_WEBHOOK_URL, payload);
-    console.log(`🗑️ メッセージ削除を検知。GAS側のログを削除しました。(ID: ${message.id})`);
+    await postToGas({ event: 'messageDelete', messageId: message.id });
+    console.log(`🗑️ 削除メッセージをGASへ通知しました: ${message.id}`);
   } catch (error) {
-    console.error('GASへの削除イベント転送に失敗しました:', error.message);
+    console.error(`❌ メッセージ削除通知失敗: ${error.message}`);
   }
 });
 
 // ===============================================================
-// 🌐 機能4：GASからの一括同期リクエストを受付 (/sync)
+// 機能4：GASからの一括同期
 // ===============================================================
-app.post('/sync', async (req, res) => {
-  res.status(200).json({ status: "processing", message: "一括同期を開始します。" });
-  console.log(`🔄 GASからのリクエストにより、対象チャンネル (${TARGET_CHANNEL_ID}) の一括同期処理を開始します...`);
 
+async function fetchMessagesForSync(channel, maximum) {
+  const collected = [];
+  let before;
+
+  while (collected.length < maximum) {
+    const remaining = maximum - collected.length;
+    const batch = await channel.messages.fetch({
+      limit: Math.min(100, remaining),
+      ...(before ? { before } : {})
+    });
+
+    if (batch.size === 0) break;
+    collected.push(...batch.values());
+    before = batch.last().id;
+    if (batch.size < Math.min(100, remaining)) break;
+  }
+
+  return collected;
+}
+
+async function performBulkSync() {
   try {
+    console.log(`🔄 一括同期開始（最大${MAX_SYNC_MESSAGES}メッセージ）`);
     const allLogs = [];
-
-    // 【改善コア】サーバーごとのループを廃止し、Bot全体のチャンネル管理から一本釣り
     const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
-    if (channel && channel.isTextBased()) {
-      const guild = channel.guild; // チャンネルが所属する正しいサーバー情報を取得
-      
-      const messages = await channel.messages.fetch({ limit: 100 });
-      for (const [messageId, message] of messages) {
-        const reactions = message.reactions.cache;
-        for (const [emojiId, reaction] of reactions) {
-          const users = await reaction.users.fetch();
-          for (const [userId, user] of users) {
-            if (user.bot) continue;
 
-            const member = await guild.members.fetch(userId).catch(() => null);
-            const userName = member ? member.displayName : user.username;
-            const emojiDisplay = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
-
-            allLogs.push({
-              timestamp: message.createdAt.toISOString(),
-              userName: userName,
-              userId: userId,
-              emoji: emojiDisplay,
-              action: '追加',
-              messageId: messageId,
-              messageContent: message.content || "（内容取得不可）"
-            });
-          }
-        }
-      }
-    } else {
-      console.error(`❌ 指定されたID (${TARGET_CHANNEL_ID}) のテキストチャンネルが見つかりませんでした。`);
+    if (!channel || !channel.isTextBased() || !channel.guild) {
+      throw new Error(`対象テキストチャンネルが見つかりません: ${TARGET_CHANNEL_ID}`);
     }
 
-    // GASへデータを一括送信
-    await axios.post(GAS_WEBHOOK_URL, {
-      event: 'bulkSync',
-      data: allLogs
-    });
-    console.log(`✅ 一括同期が完了しました。対象チャンネルの総リアクション数: ${allLogs.length}件`);
+    const messages = await fetchMessagesForSync(channel, MAX_SYNC_MESSAGES);
 
+    for (const message of messages) {
+      for (const reaction of message.reactions.cache.values()) {
+        const users = await reaction.users.fetch();
+
+        for (const user of users.values()) {
+          if (user.bot) continue;
+
+          const member = await channel.guild.members.fetch(user.id).catch(() => null);
+          allLogs.push({
+            timestamp: message.createdAt.toISOString(),
+            userName: member?.displayName || user.username,
+            userId: user.id,
+            emoji: reaction.emoji.id
+              ? `<:${reaction.emoji.name}:${reaction.emoji.id}>`
+              : reaction.emoji.name,
+            action: '追加',
+            messageId: message.id,
+            messageContent: message.content || '（内容取得不可）'
+          });
+        }
+      }
+    }
+
+    await postToGas({ event: 'bulkSync', data: allLogs });
+    console.log(
+      `✅ 一括同期完了: ${messages.length}メッセージ、${allLogs.length}リアクション`
+    );
   } catch (error) {
-    console.error('❌ 一括同期処理中に致命的なエラーが発生しました:', error.message);
+    console.error(`❌ 一括同期失敗: ${error.message}`);
+  } finally {
+    syncInProgress = false;
   }
+}
+
+app.post('/sync', (req, res) => {
+  if (!client.isReady()) {
+    return res.status(503).json({ status: 'error', message: 'Discordへ未接続です。' });
+  }
+
+  if (syncInProgress) {
+    return res.status(200).json({ status: 'already_processing' });
+  }
+
+  syncInProgress = true;
+  res.status(200).json({ status: 'processing', message: '一括同期を開始しました。' });
+  void performBulkSync();
 });
 
-// Renderのポート待受
-const PORT = process.env.PORT || 3000;
+// ===============================================================
+// エラー記録と終了処理
+// ===============================================================
+
+client.on('error', error => console.error('❌ Discordクライアントエラー:', error));
+client.on('warn', warning => console.warn('⚠️ Discord警告:', warning));
+
+process.on('unhandledRejection', error => {
+  console.error('❌ 未処理のPromiseエラー:', error);
+});
+
+function shutdown(signal) {
+  console.log(`🛑 ${signal}を受信したため終了します。`);
+  client.destroy();
+  process.exit(0);
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+
 app.listen(PORT, () => {
   console.log(`🌐 Web Server listening on port ${PORT}`);
 });
 
-client.login(DISCORD_BOT_TOKEN);
+client.login(DISCORD_BOT_TOKEN).catch(error => {
+  console.error(`❌ Discordへのログイン失敗: ${error.message}`);
+  process.exit(1);
+});
