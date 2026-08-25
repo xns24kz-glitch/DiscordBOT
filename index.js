@@ -48,6 +48,8 @@ const client = new Client({
 let TRIGGER_VC_ID = '';
 let CATEGORY_ID = '';
 let syncInProgress = false;
+let discordConnectInProgress = false;
+let discordRetryTimer = null;
 
 // チャンネルID => 部屋番号
 const createdVoiceChannels = new Map();
@@ -420,8 +422,9 @@ client.on('shardReconnecting', shardId => {
   console.log(`🔄 Discordへ再接続中 (Shard ${shardId})`);
 });
 client.on('invalidated', () => {
-  console.error('❌ Discordセッションが無効になりました。プロセスを終了します。');
-  process.exit(1);
+  console.error('❌ Discordセッションが無効になりました。5分後に再接続します。');
+  client.destroy();
+  scheduleDiscordReconnect();
 });
 
 process.on('unhandledRejection', error => {
@@ -441,34 +444,23 @@ app.listen(PORT, () => {
   console.log(`🌐 Web Server listening on port ${PORT}`);
 });
 
-async function validateDiscordToken() {
-  console.log('🔐 Discordトークンの有効性を確認しています...');
-
-  const response = await axios.get('https://discord.com/api/v10/users/@me', {
-    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
-    timeout: 15000,
-    validateStatus: () => true
-  });
-
-  if (response.status !== 200) {
-    throw new Error(`Discordがトークンを拒否しました (HTTP ${response.status})`);
-  }
-
-  console.log(`✅ Discordトークンは有効です: ${response.data.username}`);
-}
-
 async function startDiscordClient() {
+  if (client.isReady() || discordConnectInProgress) return;
+  discordConnectInProgress = true;
+
+  let timeoutId;
+  let readyHandler;
+
   try {
-    await validateDiscordToken();
     console.log('🔌 Discord Gatewayへ接続を開始します...');
 
-    let timeoutId;
     const readyPromise = new Promise((resolve, reject) => {
       timeoutId = setTimeout(() => {
-        reject(new Error('45秒以内にDiscordのclientReadyイベントを受信できませんでした'));
-      }, 45000);
+        reject(new Error('120秒以内にDiscordのclientReadyイベントを受信できませんでした'));
+      }, 120000);
 
-      client.once('clientReady', resolve);
+      readyHandler = resolve;
+      client.once('clientReady', readyHandler);
     });
 
     await Promise.all([
@@ -479,10 +471,24 @@ async function startDiscordClient() {
     clearTimeout(timeoutId);
     console.log('✅ Discord Gateway接続を確認しました。');
   } catch (error) {
-    console.error(`❌ Discord起動診断: ${error.message}`);
+    if (timeoutId) clearTimeout(timeoutId);
+    console.error(`❌ Discord接続失敗: ${error.message}`);
     client.destroy();
-    process.exit(1);
+    scheduleDiscordReconnect();
+  } finally {
+    if (readyHandler) client.off('clientReady', readyHandler);
+    discordConnectInProgress = false;
   }
+}
+
+function scheduleDiscordReconnect() {
+  if (discordRetryTimer) return;
+  console.log('⏳ Discordのアクセス制限を避けるため、5分後に再接続します。');
+
+  discordRetryTimer = setTimeout(() => {
+    discordRetryTimer = null;
+    void startDiscordClient();
+  }, 300000);
 }
 
 void startDiscordClient();
