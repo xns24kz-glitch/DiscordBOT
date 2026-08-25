@@ -187,7 +187,7 @@ app.get('/', (req, res) => {
 // Bot起動
 // ===============================================================
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`🤖 Bot起動完了: ${client.user.tag}`);
 
   const loaded = await loadVoiceConfig();
@@ -408,6 +408,21 @@ app.post('/sync', (req, res) => {
 
 client.on('error', error => console.error('❌ Discordクライアントエラー:', error));
 client.on('warn', warning => console.warn('⚠️ Discord警告:', warning));
+client.on('shardError', (error, shardId) => {
+  console.error(`❌ Discord Gatewayエラー (Shard ${shardId}): ${error.message}`);
+});
+client.on('shardDisconnect', (event, shardId) => {
+  console.error(
+    `❌ Discord切断 (Shard ${shardId}): code=${event.code}, reason=${event.reason || '理由なし'}`
+  );
+});
+client.on('shardReconnecting', shardId => {
+  console.log(`🔄 Discordへ再接続中 (Shard ${shardId})`);
+});
+client.on('invalidated', () => {
+  console.error('❌ Discordセッションが無効になりました。プロセスを終了します。');
+  process.exit(1);
+});
 
 process.on('unhandledRejection', error => {
   console.error('❌ 未処理のPromiseエラー:', error);
@@ -426,7 +441,48 @@ app.listen(PORT, () => {
   console.log(`🌐 Web Server listening on port ${PORT}`);
 });
 
-client.login(DISCORD_BOT_TOKEN).catch(error => {
-  console.error(`❌ Discordへのログイン失敗: ${error.message}`);
-  process.exit(1);
-});
+async function validateDiscordToken() {
+  console.log('🔐 Discordトークンの有効性を確認しています...');
+
+  const response = await axios.get('https://discord.com/api/v10/users/@me', {
+    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+    timeout: 15000,
+    validateStatus: () => true
+  });
+
+  if (response.status !== 200) {
+    throw new Error(`Discordがトークンを拒否しました (HTTP ${response.status})`);
+  }
+
+  console.log(`✅ Discordトークンは有効です: ${response.data.username}`);
+}
+
+async function startDiscordClient() {
+  try {
+    await validateDiscordToken();
+    console.log('🔌 Discord Gatewayへ接続を開始します...');
+
+    let timeoutId;
+    const readyPromise = new Promise((resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error('45秒以内にDiscordのclientReadyイベントを受信できませんでした'));
+      }, 45000);
+
+      client.once('clientReady', resolve);
+    });
+
+    await Promise.all([
+      client.login(DISCORD_BOT_TOKEN),
+      readyPromise
+    ]);
+
+    clearTimeout(timeoutId);
+    console.log('✅ Discord Gateway接続を確認しました。');
+  } catch (error) {
+    console.error(`❌ Discord起動診断: ${error.message}`);
+    client.destroy();
+    process.exit(1);
+  }
+}
+
+void startDiscordClient();
