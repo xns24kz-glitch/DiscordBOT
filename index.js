@@ -1,4 +1,5 @@
-// 【GitHub / Render専用】この内容をGitHubの index.js に貼り付けてください。
+// 【導入順2】Apps Scriptのデプロイ後、こちらをGitHubの index.jsへ貼り付けてください。
+// 【GitHub / Render専用・現在状態同期版】この内容をGitHubの index.js に貼り付けてください。
 // 【重要】Google Apps Scriptのコード.gsには貼り付けないでください。
 const { Client, GatewayIntentBits, Partials, ChannelType } = require('discord.js');
 const express = require('express');
@@ -19,6 +20,13 @@ const MAX_SYNC_MESSAGES = Math.max(
   Number.parseInt(process.env.MAX_SYNC_MESSAGES || '1000', 10) || 1000
 );
 
+// BOT起動中はこの間隔でDiscordの現在状態を全件再同期します（初期値10分）。
+const FULL_SYNC_INTERVAL_MINUTES = Math.max(
+  5,
+  Number.parseInt(process.env.FULL_SYNC_INTERVAL_MINUTES || '10', 10) || 10
+);
+const FULL_SYNC_INTERVAL_MS = FULL_SYNC_INTERVAL_MINUTES * 60 * 1000;
+
 if (!DISCORD_BOT_TOKEN) {
   throw new Error('Renderの環境変数 DISCORD_TOKEN が設定されていません。');
 }
@@ -31,7 +39,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const gasClient = axios.create({
-  timeout: 15000,
+  timeout: 60000,
   headers: { 'Content-Type': 'application/json' }
 });
 
@@ -50,6 +58,8 @@ const client = new Client({
 let TRIGGER_VC_ID = '';
 let CATEGORY_ID = '';
 let syncInProgress = false;
+let periodicSyncTimer = null;
+const messageSnapshotTimers = new Map();
 
 // チャンネルID => 部屋番号
 const createdVoiceChannels = new Map();
@@ -172,6 +182,95 @@ function makeReactionPayload(reaction, user, action) {
   };
 }
 
+function formatEmoji(emoji) {
+  return emoji.id ? `<:${emoji.name}:${emoji.id}>` : emoji.name;
+}
+
+async function fetchAllReactionUsers(reaction) {
+  const users = [];
+  let after;
+
+  while (true) {
+    const batch = await reaction.users.fetch({
+      limit: 100,
+      ...(after ? { after } : {})
+    });
+
+    for (const user of batch.values()) {
+      if (!user.bot) users.push(user);
+    }
+
+    if (batch.size < 100) break;
+    after = batch.last()?.id;
+    if (!after) break;
+  }
+
+  return users;
+}
+
+async function buildMessageSnapshot(message) {
+  if (message.partial) await message.fetch();
+  const guild = message.guild;
+  const reactions = [];
+
+  for (const reaction of message.reactions.cache.values()) {
+    const users = await fetchAllReactionUsers(reaction);
+
+    for (const user of users) {
+      const member = guild
+        ? (guild.members.cache.get(user.id) || await guild.members.fetch(user.id).catch(() => null))
+        : null;
+
+      reactions.push({
+        userId: user.id,
+        userName: member?.displayName || user.username,
+        emoji: formatEmoji(reaction.emoji)
+      });
+    }
+  }
+
+  return {
+    messageId: message.id,
+    messageContent: message.content || '[画像または埋め込みメッセージ]',
+    createdAt: message.createdAt?.toISOString() || new Date().toISOString(),
+    editedAt: message.editedAt?.toISOString() || '',
+    reactions
+  };
+}
+
+async function syncSingleMessage(messageId, reason = 'event') {
+  if (!client.isReady()) return;
+
+  try {
+    const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
+    if (!channel || !channel.isTextBased()) {
+      throw new Error(`対象テキストチャンネルが見つかりません: ${TARGET_CHANNEL_ID}`);
+    }
+
+    const message = await channel.messages.fetch(messageId);
+    const snapshot = await buildMessageSnapshot(message);
+    await postToGas({ event: 'messageSnapshot', reason, message: snapshot });
+    console.log(
+      `📨 現在状態を同期: ${messageId}（${snapshot.reactions.length}リアクション）`
+    );
+  } catch (error) {
+    if (error.code === 10008) return;
+    console.error(`❌ メッセージ現在状態の同期失敗 (${messageId}): ${error.message}`);
+  }
+}
+
+function queueMessageSnapshot(messageId, reason) {
+  const existingTimer = messageSnapshotTimers.get(messageId);
+  if (existingTimer) clearTimeout(existingTimer);
+
+  const timer = setTimeout(() => {
+    messageSnapshotTimers.delete(messageId);
+    void syncSingleMessage(messageId, reason);
+  }, 1200);
+
+  messageSnapshotTimers.set(messageId, timer);
+}
+
 // ===============================================================
 // Renderの生存確認
 // ===============================================================
@@ -203,6 +302,23 @@ client.once('clientReady', async () => {
         await restoreTemporaryVoiceChannels();
       }
     }, 60000);
+  }
+
+  // 再起動中に起きたリアクションも復元できるよう、起動後に全体同期します。
+  setTimeout(() => {
+    if (!syncInProgress) {
+      syncInProgress = true;
+      void performBulkSync('startup');
+    }
+  }, 10000);
+
+  if (!periodicSyncTimer) {
+    periodicSyncTimer = setInterval(() => {
+      if (!client.isReady() || syncInProgress) return;
+      syncInProgress = true;
+      void performBulkSync('periodic');
+    }, FULL_SYNC_INTERVAL_MS);
+    console.log(`⏱️ 現在状態の全体同期を${FULL_SYNC_INTERVAL_MINUTES}分おきに実行します。`);
   }
 });
 
@@ -288,6 +404,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     await prepareReaction(reaction);
     if (reaction.message.channelId !== TARGET_CHANNEL_ID) return;
     await postToGas(makeReactionPayload(reaction, user, '追加'));
+    queueMessageSnapshot(reaction.message.id, 'reactionAdd');
   } catch (error) {
     console.error(`❌ リアクション追加の処理失敗: ${error.message}`);
   }
@@ -300,8 +417,40 @@ client.on('messageReactionRemove', async (reaction, user) => {
     await prepareReaction(reaction);
     if (reaction.message.channelId !== TARGET_CHANNEL_ID) return;
     await postToGas(makeReactionPayload(reaction, user, '削除'));
+    queueMessageSnapshot(reaction.message.id, 'reactionRemove');
   } catch (error) {
     console.error(`❌ リアクション削除の処理失敗: ${error.message}`);
+  }
+});
+
+client.on('messageReactionRemoveAll', message => {
+  if (message.channelId !== TARGET_CHANNEL_ID) return;
+  queueMessageSnapshot(message.id, 'reactionRemoveAll');
+});
+
+client.on('messageReactionRemoveEmoji', async reaction => {
+  try {
+    await prepareReaction(reaction);
+    if (reaction.message.channelId !== TARGET_CHANNEL_ID) return;
+    queueMessageSnapshot(reaction.message.id, 'reactionRemoveEmoji');
+  } catch (error) {
+    console.error(`❌ リアクション全削除の同期失敗: ${error.message}`);
+  }
+});
+
+// 新規投稿・編集も現在状態へ反映します。リアクション0件の投稿も対象です。
+client.on('messageCreate', message => {
+  if (message.channelId !== TARGET_CHANNEL_ID) return;
+  queueMessageSnapshot(message.id, 'messageCreate');
+});
+
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+  try {
+    if (newMessage.partial) await newMessage.fetch();
+    if (newMessage.channelId !== TARGET_CHANNEL_ID) return;
+    queueMessageSnapshot(newMessage.id, 'messageUpdate');
+  } catch (error) {
+    console.error(`❌ メッセージ編集同期失敗: ${error.message}`);
   }
 });
 
@@ -317,6 +466,20 @@ client.on('messageDelete', async message => {
     console.log(`🗑️ 削除メッセージをGASへ通知しました: ${message.id}`);
   } catch (error) {
     console.error(`❌ メッセージ削除通知失敗: ${error.message}`);
+  }
+});
+
+client.on('messageDeleteBulk', async messages => {
+  const targetMessages = [...messages.values()].filter(
+    message => message.channelId === TARGET_CHANNEL_ID
+  );
+
+  for (const message of targetMessages) {
+    try {
+      await postToGas({ event: 'messageDelete', messageId: message.id });
+    } catch (error) {
+      console.error(`❌ 一括削除メッセージの通知失敗 (${message.id}): ${error.message}`);
+    }
   }
 });
 
@@ -344,10 +507,11 @@ async function fetchMessagesForSync(channel, maximum) {
   return collected;
 }
 
-async function performBulkSync() {
+async function performBulkSync(reason = 'manual') {
   try {
-    console.log(`🔄 一括同期開始（最大${MAX_SYNC_MESSAGES}メッセージ）`);
-    const allLogs = [];
+    console.log(
+      `🔄 現在状態の全体同期開始（理由=${reason}、最大${MAX_SYNC_MESSAGES}メッセージ）`
+    );
     const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
 
     if (!channel || !channel.isTextBased() || !channel.guild) {
@@ -355,33 +519,25 @@ async function performBulkSync() {
     }
 
     const messages = await fetchMessagesForSync(channel, MAX_SYNC_MESSAGES);
+    const snapshots = [];
 
     for (const message of messages) {
-      for (const reaction of message.reactions.cache.values()) {
-        const users = await reaction.users.fetch();
-
-        for (const user of users.values()) {
-          if (user.bot) continue;
-
-          const member = await channel.guild.members.fetch(user.id).catch(() => null);
-          allLogs.push({
-            timestamp: message.createdAt.toISOString(),
-            userName: member?.displayName || user.username,
-            userId: user.id,
-            emoji: reaction.emoji.id
-              ? `<:${reaction.emoji.name}:${reaction.emoji.id}>`
-              : reaction.emoji.name,
-            action: '追加',
-            messageId: message.id,
-            messageContent: message.content || '（内容取得不可）'
-          });
-        }
-      }
+      snapshots.push(await buildMessageSnapshot(message));
     }
 
-    await postToGas({ event: 'bulkSync', data: allLogs });
+    const reactionCount = snapshots.reduce(
+      (total, message) => total + message.reactions.length,
+      0
+    );
+
+    await postToGas({
+      event: 'fullSnapshot',
+      reason,
+      syncedAt: new Date().toISOString(),
+      messages: snapshots
+    });
     console.log(
-      `✅ 一括同期完了: ${messages.length}メッセージ、${allLogs.length}リアクション`
+      `✅ 現在状態の全体同期完了: ${snapshots.length}メッセージ、${reactionCount}リアクション`
     );
   } catch (error) {
     console.error(`❌ 一括同期失敗: ${error.message}`);
@@ -401,7 +557,7 @@ app.post('/sync', (req, res) => {
 
   syncInProgress = true;
   res.status(200).json({ status: 'processing', message: '一括同期を開始しました。' });
-  void performBulkSync();
+  void performBulkSync('manual');
 });
 
 // ===============================================================
@@ -431,6 +587,8 @@ process.on('unhandledRejection', error => {
 
 function shutdown(signal) {
   console.log(`🛑 ${signal}を受信したため終了します。`);
+  if (periodicSyncTimer) clearInterval(periodicSyncTimer);
+  for (const timer of messageSnapshotTimers.values()) clearTimeout(timer);
   client.destroy();
   process.exit(0);
 }
