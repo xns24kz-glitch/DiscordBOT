@@ -60,6 +60,8 @@ let CATEGORY_ID = '';
 let syncInProgress = false;
 let periodicSyncTimer = null;
 const messageSnapshotTimers = new Map();
+const pendingMessageSnapshots = new Map();
+let gasRequestChain = Promise.resolve();
 
 // チャンネルID => 部屋番号
 const createdVoiceChannels = new Map();
@@ -73,12 +75,21 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function postToGas(payload, attempts = 3) {
+async function postToGasDirect(payload, attempts = 5) {
   let lastError;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await gasClient.post(GAS_WEBHOOK_URL, payload);
+      const response = await gasClient.post(GAS_WEBHOOK_URL, payload);
+      if (response.data?.status === 'busy') {
+        const busyError = new Error('GASが別の同期処理を実行中です。');
+        busyError.code = 'GAS_BUSY';
+        throw busyError;
+      }
+      if (response.data?.status === 'error') {
+        throw new Error(`GAS処理エラー: ${response.data.message || '詳細なし'}`);
+      }
+      return response;
     } catch (error) {
       lastError = error;
       const status = error.response?.status;
@@ -87,13 +98,20 @@ async function postToGas(payload, attempts = 3) {
         `${status ? ` HTTP ${status}` : ''}: ${error.message}`
       );
 
-      if (attempt < attempts) {
-        await wait(1000 * attempt);
-      }
+      if (attempt < attempts) await wait(1500 * attempt);
     }
   }
 
   throw lastError;
+}
+
+// GASへの同時アクセスを防ぎ、リアクション集中時も必ず1件ずつ送ります。
+function postToGas(payload, attempts = 5) {
+  const request = gasRequestChain
+    .catch(() => undefined)
+    .then(() => postToGasDirect(payload, attempts));
+  gasRequestChain = request;
+  return request;
 }
 
 async function loadVoiceConfig() {
@@ -265,10 +283,25 @@ function queueMessageSnapshot(messageId, reason) {
 
   const timer = setTimeout(() => {
     messageSnapshotTimers.delete(messageId);
+    if (syncInProgress) {
+      pendingMessageSnapshots.set(messageId, reason);
+      return;
+    }
     void syncSingleMessage(messageId, reason);
   }, 1200);
 
   messageSnapshotTimers.set(messageId, timer);
+}
+
+async function flushPendingMessageSnapshots() {
+  if (pendingMessageSnapshots.size === 0) return;
+  const pending = [...pendingMessageSnapshots.entries()];
+  pendingMessageSnapshots.clear();
+
+  console.log(`🔁 全体同期中に保留した${pending.length}件を再同期します。`);
+  for (const [messageId, reason] of pending) {
+    await syncSingleMessage(messageId, `${reason}:afterFullSync`);
+  }
 }
 
 // ===============================================================
@@ -543,6 +576,7 @@ async function performBulkSync(reason = 'manual') {
     console.error(`❌ 一括同期失敗: ${error.message}`);
   } finally {
     syncInProgress = false;
+    await flushPendingMessageSnapshots();
   }
 }
 
@@ -589,6 +623,7 @@ function shutdown(signal) {
   console.log(`🛑 ${signal}を受信したため終了します。`);
   if (periodicSyncTimer) clearInterval(periodicSyncTimer);
   for (const timer of messageSnapshotTimers.values()) clearTimeout(timer);
+  pendingMessageSnapshots.clear();
   client.destroy();
   process.exit(0);
 }
